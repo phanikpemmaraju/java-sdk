@@ -231,18 +231,13 @@ public class McpSyncServer {
 	}
 
 	/**
-	 * This implementation would, incorrectly, broadcast the logging message to all
-	 * connected clients, using a single minLoggingLevel for all of them. Similar to the
-	 * sampling and roots, the logging level should be set per client session and use the
-	 * ServerExchange to send the logging message to the right client.
-	 * @param loggingMessageNotification The logging message to send
-	 * @deprecated Use
-	 * {@link McpSyncServerExchange#loggingNotification(LoggingMessageNotification)}
-	 * instead.
+	 * Sends an elicitation complete notification to a specific client session, indicating
+	 * that an out-of-band URL elicitation interaction has completed.
+	 * @param sessionId The ID of the session to notify
+	 * @param notification The notification containing the elicitation ID
 	 */
-	@Deprecated
-	public void loggingNotification(LoggingMessageNotification loggingMessageNotification) {
-		this.asyncServer.loggingNotification(loggingMessageNotification).block();
+	public void sendElicitationComplete(String sessionId, McpSchema.ElicitationCompleteNotification notification) {
+		this.asyncServer.sendElicitationComplete(sessionId, notification).block();
 	}
 
 	/**

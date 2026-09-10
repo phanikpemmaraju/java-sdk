@@ -1,10 +1,9 @@
 /*
- * Copyright 2024-2024 the original author or authors.
+ * Copyright 2024-2026 the original author or authors.
  */
 
 package io.modelcontextprotocol.server.transport;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.time.Duration;
@@ -13,12 +12,10 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import io.modelcontextprotocol.json.TypeRef;
-
 import io.modelcontextprotocol.common.McpTransportContext;
+import io.modelcontextprotocol.json.McpJsonDefaults;
+import io.modelcontextprotocol.json.McpJsonMapper;
+import io.modelcontextprotocol.json.TypeRef;
 import io.modelcontextprotocol.server.McpTransportContextExtractor;
 import io.modelcontextprotocol.spec.HttpHeaders;
 import io.modelcontextprotocol.spec.McpError;
@@ -28,7 +25,6 @@ import io.modelcontextprotocol.spec.McpStreamableServerTransport;
 import io.modelcontextprotocol.spec.McpStreamableServerTransportProvider;
 import io.modelcontextprotocol.spec.ProtocolVersions;
 import io.modelcontextprotocol.util.Assert;
-import io.modelcontextprotocol.json.McpJsonMapper;
 import io.modelcontextprotocol.util.KeepAliveScheduler;
 import jakarta.servlet.AsyncContext;
 import jakarta.servlet.ServletException;
@@ -36,6 +32,8 @@ import jakarta.servlet.annotation.WebServlet;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -60,6 +58,11 @@ import reactor.core.publisher.Mono;
 @WebServlet(asyncSupported = true)
 public class HttpServletStreamableServerTransportProvider extends HttpServlet
 		implements McpStreamableServerTransportProvider {
+
+	/**
+	 * Default maximum size of a single request body: 16 MiB (16 * 1024 * 1024 bytes).
+	 */
+	private static final int DEFAULT_REQUEST_MAX_SIZE = 16 * 1024 * 1024;
 
 	private static final Logger logger = LoggerFactory.getLogger(HttpServletStreamableServerTransportProvider.class);
 
@@ -99,6 +102,11 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 	private final McpJsonMapper jsonMapper;
 
+	/**
+	 * Maximum size, in bytes, of a single request body accepted by this transport.
+	 */
+	private final int requestMaxSize;
+
 	private McpStreamableServerSession.Factory sessionFactory;
 
 	/**
@@ -120,6 +128,11 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 	private KeepAliveScheduler keepAliveScheduler;
 
 	/**
+	 * Security validator for validating HTTP requests.
+	 */
+	private final ServerHttpHeaderValidator httpHeaderValidator;
+
+	/**
 	 * Constructs a new HttpServletStreamableServerTransportProvider instance.
 	 * @param jsonMapper The JsonMapper to use for JSON serialization/deserialization of
 	 * messages.
@@ -127,19 +140,28 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 	 * messages via HTTP. This endpoint will handle GET, POST, and DELETE requests.
 	 * @param disallowDelete Whether to disallow DELETE requests on the endpoint.
 	 * @param contextExtractor The extractor for transport context from the request.
+	 * @param keepAliveInterval The interval for keep-alive pings. If null, no keep-alive
+	 * will be scheduled.
+	 * @param httpHeaderValidator The HTTP header validator for validating HTTP requests.
+	 * @param requestMaxSize The maximum size, in bytes, of a single request body. Must be
+	 * positive.
 	 * @throws IllegalArgumentException if any parameter is null
 	 */
 	private HttpServletStreamableServerTransportProvider(McpJsonMapper jsonMapper, String mcpEndpoint,
 			boolean disallowDelete, McpTransportContextExtractor<HttpServletRequest> contextExtractor,
-			Duration keepAliveInterval) {
+			Duration keepAliveInterval, ServerHttpHeaderValidator httpHeaderValidator, int requestMaxSize) {
 		Assert.notNull(jsonMapper, "JsonMapper must not be null");
 		Assert.notNull(mcpEndpoint, "MCP endpoint must not be null");
 		Assert.notNull(contextExtractor, "Context extractor must not be null");
+		Assert.notNull(httpHeaderValidator, "HTTP header validator must not be null");
+		Assert.isTrue(requestMaxSize > 0, "requestMaxSize must be positive");
 
 		this.jsonMapper = jsonMapper;
 		this.mcpEndpoint = mcpEndpoint;
 		this.disallowDelete = disallowDelete;
 		this.contextExtractor = contextExtractor;
+		this.httpHeaderValidator = httpHeaderValidator;
+		this.requestMaxSize = requestMaxSize;
 
 		if (keepAliveInterval != null) {
 
@@ -152,12 +174,6 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			this.keepAliveScheduler.start();
 		}
 
-	}
-
-	@Override
-	public List<String> protocolVersions() {
-		return List.of(ProtocolVersions.MCP_2024_11_05, ProtocolVersions.MCP_2025_03_26,
-				ProtocolVersions.MCP_2025_06_18);
 	}
 
 	@Override
@@ -188,9 +204,21 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 					session.sendNotification(method, params).block();
 				}
 				catch (Exception e) {
-					logger.error("Failed to send message to session {}: {}", session.getId(), e.getMessage());
+					logger.info("Failed to send message to session {}: {}", session.getId(), e.getMessage());
 				}
 			});
+		});
+	}
+
+	@Override
+	public Mono<Void> notifyClient(String sessionId, String method, Object params) {
+		return Mono.defer(() -> {
+			McpStreamableServerSession session = this.sessions.get(sessionId);
+			if (session == null) {
+				logger.debug("Session {} not found", sessionId);
+				return Mono.empty();
+			}
+			return session.sendNotification(method, params);
 		});
 	}
 
@@ -209,12 +237,11 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 					session.closeGracefully().block();
 				}
 				catch (Exception e) {
-					logger.error("Failed to close session {}: {}", session.getId(), e.getMessage());
+					logger.warn("Failed to close session {}: {}", session.getId(), e.getMessage());
 				}
 			});
 
 			this.sessions.clear();
-			logger.debug("Graceful shutdown completed");
 		}).then().doOnSuccess(v -> {
 			sessions.clear();
 			logger.debug("Graceful shutdown completed");
@@ -246,6 +273,14 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			return;
 		}
 
+		try {
+			this.httpHeaderValidator.validate(new HttpServletHeaderAccessor(request));
+		}
+		catch (ServerTransportSecurityException e) {
+			response.sendError(e.getStatusCode(), e.getMessage());
+			return;
+		}
+
 		List<String> badRequestErrors = new ArrayList<>();
 
 		String accept = request.getHeader(ACCEPT);
@@ -261,7 +296,8 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 		if (!badRequestErrors.isEmpty()) {
 			String combinedMessage = String.join("; ", badRequestErrors);
-			this.responseError(response, HttpServletResponse.SC_BAD_REQUEST, new McpError(combinedMessage));
+			this.responseError(response, HttpServletResponse.SC_BAD_REQUEST,
+					McpError.builder(McpSchema.ErrorCodes.METHOD_NOT_FOUND).message(combinedMessage).build());
 			return;
 		}
 
@@ -281,7 +317,6 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			response.setCharacterEncoding(UTF_8);
 			response.setHeader("Cache-Control", "no-cache");
 			response.setHeader("Connection", "keep-alive");
-			response.setHeader("Access-Control-Allow-Origin", "*");
 
 			AsyncContext asyncContext = request.startAsync();
 			asyncContext.setTimeout(0);
@@ -289,65 +324,76 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			HttpServletStreamableMcpSessionTransport sessionTransport = new HttpServletStreamableMcpSessionTransport(
 					sessionId, asyncContext, response.getWriter());
 
-			// Check if this is a replay request
-			if (request.getHeader(HttpHeaders.LAST_EVENT_ID) != null) {
-				String lastId = request.getHeader(HttpHeaders.LAST_EVENT_ID);
-
-				try {
-					session.replay(lastId)
-						.contextWrite(ctx -> ctx.put(McpTransportContext.KEY, transportContext))
-						.toIterable()
-						.forEach(message -> {
-							try {
-								sessionTransport.sendMessage(message)
-									.contextWrite(ctx -> ctx.put(McpTransportContext.KEY, transportContext))
-									.block();
-							}
-							catch (Exception e) {
-								logger.error("Failed to replay message: {}", e.getMessage());
-								asyncContext.complete();
-							}
-						});
-				}
-				catch (Exception e) {
-					logger.error("Failed to replay messages: {}", e.getMessage());
-					asyncContext.complete();
-				}
+			// Replay the messages the client missed while its stream was broken
+			String lastEventId = request.getHeader(HttpHeaders.LAST_EVENT_ID);
+			if (lastEventId != null
+					&& !this.tryReplayMissedMessages(session, lastEventId, sessionTransport, transportContext)) {
+				// The replay failed and already closed the transport
+				return;
 			}
-			else {
-				// Establish new listening stream
-				McpStreamableServerSession.McpStreamableServerSessionStream listeningStream = session
-					.listeningStream(sessionTransport);
 
-				asyncContext.addListener(new jakarta.servlet.AsyncListener() {
-					@Override
-					public void onComplete(jakarta.servlet.AsyncEvent event) throws IOException {
-						logger.debug("SSE connection completed for session: {}", sessionId);
-						listeningStream.close();
-					}
+			// Establish the listening stream. Resumed streams are registered too, so
+			// that the session keeps delivering messages to the reconnected client and
+			// the async context is completed once the client goes away.
+			McpStreamableServerSession.McpStreamableServerSessionStream listeningStream = session
+				.listeningStream(sessionTransport);
 
-					@Override
-					public void onTimeout(jakarta.servlet.AsyncEvent event) throws IOException {
-						logger.debug("SSE connection timed out for session: {}", sessionId);
-						listeningStream.close();
-					}
+			asyncContext.addListener(new jakarta.servlet.AsyncListener() {
+				@Override
+				public void onComplete(jakarta.servlet.AsyncEvent event) throws IOException {
+					logger.debug("SSE connection completed for session: {}", sessionId);
+					listeningStream.close();
+				}
 
-					@Override
-					public void onError(jakarta.servlet.AsyncEvent event) throws IOException {
-						logger.debug("SSE connection error for session: {}", sessionId);
-						listeningStream.close();
-					}
+				@Override
+				public void onTimeout(jakarta.servlet.AsyncEvent event) throws IOException {
+					logger.debug("SSE connection timed out for session: {}", sessionId);
+					listeningStream.close();
+				}
 
-					@Override
-					public void onStartAsync(jakarta.servlet.AsyncEvent event) throws IOException {
-						// No action needed
-					}
-				});
-			}
+				@Override
+				public void onError(jakarta.servlet.AsyncEvent event) throws IOException {
+					logger.debug("SSE connection error for session: {}", sessionId);
+					listeningStream.close();
+				}
+
+				@Override
+				public void onStartAsync(jakarta.servlet.AsyncEvent event) throws IOException {
+					// No action needed
+				}
+			});
 		}
 		catch (Exception e) {
 			logger.error("Failed to handle GET request for session {}: {}", sessionId, e.getMessage());
 			response.sendError(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
+		}
+	}
+
+	/**
+	 * Replays the messages the client missed while its SSE stream was broken.
+	 * @param session the session the client is resuming
+	 * @param lastEventId the ID of the last event received by the client
+	 * @param sessionTransport the transport of the resumed SSE stream
+	 * @param transportContext the context extracted from the request
+	 * @return {@code true} if the replay completed, {@code false} if it failed, in which
+	 * case the transport has been closed
+	 */
+	private boolean tryReplayMissedMessages(McpStreamableServerSession session, String lastEventId,
+			McpStreamableServerTransport sessionTransport, McpTransportContext transportContext) {
+		try {
+			for (McpSchema.JSONRPCMessage message : session.replay(lastEventId)
+				.contextWrite(ctx -> ctx.put(McpTransportContext.KEY, transportContext))
+				.toIterable()) {
+				sessionTransport.sendMessage(message)
+					.contextWrite(ctx -> ctx.put(McpTransportContext.KEY, transportContext))
+					.block();
+			}
+			return true;
+		}
+		catch (Exception e) {
+			logger.error("Failed to replay messages for session {}: {}", session.getId(), e.getMessage());
+			sessionTransport.close();
+			return false;
 		}
 	}
 
@@ -372,6 +418,18 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Server is shutting down");
 			return;
 		}
+		if (request.getContentLengthLong() > this.requestMaxSize) {
+			response.sendError(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
+			return;
+		}
+
+		try {
+			this.httpHeaderValidator.validate(new HttpServletHeaderAccessor(request));
+		}
+		catch (ServerTransportSecurityException e) {
+			response.sendError(e.getStatusCode(), e.getMessage());
+			return;
+		}
 
 		List<String> badRequestErrors = new ArrayList<>();
 
@@ -386,21 +444,17 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 		McpTransportContext transportContext = this.contextExtractor.extract(request);
 
 		try {
-			BufferedReader reader = request.getReader();
-			StringBuilder body = new StringBuilder();
-			String line;
-			while ((line = reader.readLine()) != null) {
-				body.append(line);
-			}
+			String body = HttpServletRequestUtils.readBody(request, this.requestMaxSize);
 
-			McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(jsonMapper, body.toString());
+			McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(jsonMapper, body);
 
 			// Handle initialization request
 			if (message instanceof McpSchema.JSONRPCRequest jsonrpcRequest
 					&& jsonrpcRequest.method().equals(McpSchema.METHOD_INITIALIZE)) {
 				if (!badRequestErrors.isEmpty()) {
 					String combinedMessage = String.join("; ", badRequestErrors);
-					this.responseError(response, HttpServletResponse.SC_BAD_REQUEST, new McpError(combinedMessage));
+					this.responseError(response, HttpServletResponse.SC_BAD_REQUEST,
+							McpError.builder(McpSchema.ErrorCodes.METHOD_NOT_FOUND).message(combinedMessage).build());
 					return;
 				}
 
@@ -419,8 +473,8 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 					response.setHeader(HttpHeaders.MCP_SESSION_ID, init.session().getId());
 					response.setStatus(HttpServletResponse.SC_OK);
 
-					String jsonResponse = jsonMapper.writeValueAsString(new McpSchema.JSONRPCResponse(
-							McpSchema.JSONRPC_VERSION, jsonrpcRequest.id(), initResult, null));
+					String jsonResponse = jsonMapper
+						.writeValueAsString(McpSchema.JSONRPCResponse.result(jsonrpcRequest.id(), initResult));
 
 					PrintWriter writer = response.getWriter();
 					writer.write(jsonResponse);
@@ -430,7 +484,9 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 				catch (Exception e) {
 					logger.error("Failed to initialize session: {}", e.getMessage());
 					this.responseError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-							new McpError("Failed to initialize session: " + e.getMessage()));
+							McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR)
+								.message("Failed to initialize session: " + e.getMessage())
+								.build());
 					return;
 				}
 			}
@@ -443,7 +499,8 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 			if (!badRequestErrors.isEmpty()) {
 				String combinedMessage = String.join("; ", badRequestErrors);
-				this.responseError(response, HttpServletResponse.SC_BAD_REQUEST, new McpError(combinedMessage));
+				this.responseError(response, HttpServletResponse.SC_BAD_REQUEST,
+						McpError.builder(McpSchema.ErrorCodes.METHOD_NOT_FOUND).message(combinedMessage).build());
 				return;
 			}
 
@@ -451,7 +508,9 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 			if (session == null) {
 				this.responseError(response, HttpServletResponse.SC_NOT_FOUND,
-						new McpError("Session not found: " + sessionId));
+						McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR)
+							.message("Session not found: " + sessionId)
+							.build());
 				return;
 			}
 
@@ -473,7 +532,6 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 				response.setCharacterEncoding(UTF_8);
 				response.setHeader("Cache-Control", "no-cache");
 				response.setHeader("Connection", "keep-alive");
-				response.setHeader("Access-Control-Allow-Origin", "*");
 
 				AsyncContext asyncContext = request.startAsync();
 				asyncContext.setTimeout(0);
@@ -493,19 +551,26 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			}
 			else {
 				this.responseError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-						new McpError("Unknown message type"));
+						McpError.builder(McpSchema.ErrorCodes.INVALID_REQUEST).message("Unknown message type").build());
 			}
+		}
+		catch (MaxSizeExceededException e) {
+			response.sendError(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
 		}
 		catch (IllegalArgumentException | IOException e) {
 			logger.error("Failed to deserialize message: {}", e.getMessage());
 			this.responseError(response, HttpServletResponse.SC_BAD_REQUEST,
-					new McpError("Invalid message format: " + e.getMessage()));
+					McpError.builder(McpSchema.ErrorCodes.INVALID_REQUEST)
+						.message("Invalid message format: " + e.getMessage())
+						.build());
 		}
 		catch (Exception e) {
 			logger.error("Error handling message: {}", e.getMessage());
 			try {
 				this.responseError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-						new McpError("Error processing message: " + e.getMessage()));
+						McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR)
+							.message("Error processing message: " + e.getMessage())
+							.build());
 			}
 			catch (IOException ex) {
 				logger.error(FAILED_TO_SEND_ERROR_RESPONSE, ex.getMessage());
@@ -536,6 +601,14 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			return;
 		}
 
+		try {
+			this.httpHeaderValidator.validate(new HttpServletHeaderAccessor(request));
+		}
+		catch (ServerTransportSecurityException e) {
+			response.sendError(e.getStatusCode(), e.getMessage());
+			return;
+		}
+
 		if (this.disallowDelete) {
 			response.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
 			return;
@@ -545,7 +618,9 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 		if (request.getHeader(HttpHeaders.MCP_SESSION_ID) == null) {
 			this.responseError(response, HttpServletResponse.SC_BAD_REQUEST,
-					new McpError("Session ID required in mcp-session-id header"));
+					McpError.builder(McpSchema.ErrorCodes.METHOD_NOT_FOUND)
+						.message("Session ID required in mcp-session-id header")
+						.build());
 			return;
 		}
 
@@ -566,7 +641,7 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 			logger.error("Failed to delete session {}: {}", sessionId, e.getMessage());
 			try {
 				this.responseError(response, HttpServletResponse.SC_INTERNAL_SERVER_ERROR,
-						new McpError(e.getMessage()));
+						McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR).message(e.getMessage()).build());
 			}
 			catch (IOException ex) {
 				logger.error(FAILED_TO_SEND_ERROR_RESPONSE, ex.getMessage());
@@ -753,6 +828,12 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 
 	}
 
+	@Override
+	public List<String> protocolVersions() {
+		return List.of(ProtocolVersions.MCP_2025_03_26, ProtocolVersions.MCP_2025_06_18,
+				ProtocolVersions.MCP_2025_11_25);
+	}
+
 	public static Builder builder() {
 		return new Builder();
 	}
@@ -773,6 +854,10 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 				serverRequest) -> McpTransportContext.EMPTY;
 
 		private Duration keepAliveInterval;
+
+		private ServerHttpHeaderValidator httpHeaderValidator = ServerHttpHeaderValidator.NOOP;
+
+		private int requestMaxSize = DEFAULT_REQUEST_MAX_SIZE;
 
 		/**
 		 * Sets the JsonMapper to use for JSON serialization/deserialization of MCP
@@ -834,6 +919,46 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 		}
 
 		/**
+		 * Sets the security validator for validating HTTP requests.
+		 * @param securityValidator The security validator to use. Must not be null.
+		 * @return this builder instance
+		 * @throws IllegalArgumentException if securityValidator is null
+		 * @deprecated Use {@link #httpHeaderValidator(ServerHttpHeaderValidator)}
+		 * instead.
+		 */
+		@Deprecated
+		public Builder securityValidator(ServerTransportSecurityValidator securityValidator) {
+			Assert.notNull(securityValidator, "Security validator must not be null");
+			this.httpHeaderValidator = ServerTransportSecurityValidator.toHttpHeaderValidator(securityValidator);
+			return this;
+		}
+
+		/**
+		 * Sets the HTTP header validator for validating HTTP requests.
+		 * @param httpHeaderValidator The HTTP header validator to use. Must not be null.
+		 * @return this builder instance
+		 * @throws IllegalArgumentException if httpHeaderValidator is null
+		 */
+		public Builder httpHeaderValidator(ServerHttpHeaderValidator httpHeaderValidator) {
+			Assert.notNull(httpHeaderValidator, "HTTP header validator must not be null");
+			this.httpHeaderValidator = httpHeaderValidator;
+			return this;
+		}
+
+		/**
+		 * Sets the maximum size, in bytes, of a single request body accepted by this
+		 * transport. Requests whose body exceeds this size are rejected with a 413
+		 * (Payload Too Large) response. Defaults to 16 MiB if not set.
+		 * @param requestMaxSize The maximum request body size, in bytes. Must be
+		 * positive.
+		 * @return this builder instance
+		 */
+		public Builder maxRequestSize(int requestMaxSize) {
+			this.requestMaxSize = requestMaxSize;
+			return this;
+		}
+
+		/**
 		 * Builds a new instance of {@link HttpServletStreamableServerTransportProvider}
 		 * with the configured settings.
 		 * @return A new HttpServletStreamableServerTransportProvider instance
@@ -842,8 +967,8 @@ public class HttpServletStreamableServerTransportProvider extends HttpServlet
 		public HttpServletStreamableServerTransportProvider build() {
 			Assert.notNull(this.mcpEndpoint, "MCP endpoint must be set");
 			return new HttpServletStreamableServerTransportProvider(
-					jsonMapper == null ? McpJsonMapper.getDefault() : jsonMapper, mcpEndpoint, disallowDelete,
-					contextExtractor, keepAliveInterval);
+					jsonMapper == null ? McpJsonDefaults.getMapper() : jsonMapper, mcpEndpoint, disallowDelete,
+					contextExtractor, keepAliveInterval, httpHeaderValidator, requestMaxSize);
 		}
 
 	}

@@ -1,10 +1,9 @@
 /*
- * Copyright 2024 - 2024 the original author or authors.
+ * Copyright 2024 - 2026 the original author or authors.
  */
 
 package io.modelcontextprotocol.server.transport;
 
-import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.time.Duration;
@@ -15,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.modelcontextprotocol.common.McpTransportContext;
+import io.modelcontextprotocol.json.McpJsonDefaults;
 import io.modelcontextprotocol.json.McpJsonMapper;
 import io.modelcontextprotocol.json.TypeRef;
 import io.modelcontextprotocol.server.McpTransportContextExtractor;
@@ -61,13 +61,24 @@ import reactor.core.publisher.Mono;
  * </ul>
  *
  * @author Christian Tzolov
+ * @deprecated This SSE transport is deprecated. Use Streamable HTTP instead, with
+ * {@link HttpServletStreamableServerTransportProvider} or
+ * {@link HttpServletStatelessServerTransport}.
  * @author Alexandros Pappas
  * @see McpServerTransportProvider
  * @see HttpServlet
+ * @see <a href=
+ * "https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#backwards-compatibility">Transports
+ * backwards compatibility</a>
  */
-
+@Deprecated
 @WebServlet(asyncSupported = true)
 public class HttpServletSseServerTransportProvider extends HttpServlet implements McpServerTransportProvider {
+
+	/**
+	 * Default maximum size of a single request body: 16 MiB (16 * 1024 * 1024 bytes).
+	 */
+	private static final int DEFAULT_REQUEST_MAX_SIZE = 16 * 1024 * 1024;
 
 	/**
 	 * Logger for this class
@@ -103,6 +114,11 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 	 * JSON mapper for serialization/deserialization
 	 */
 	private final McpJsonMapper jsonMapper;
+
+	/**
+	 * Maximum size, in bytes, of a single request body accepted by this transport.
+	 */
+	private final int requestMaxSize;
 
 	/**
 	 * Base URL for the server transport
@@ -143,6 +159,11 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 	private KeepAliveScheduler keepAliveScheduler;
 
 	/**
+	 * Security validator for validating HTTP requests.
+	 */
+	private final ServerHttpHeaderValidator httpHeaderValidator;
+
+	/**
 	 * Creates a new HttpServletSseServerTransportProvider instance with a custom SSE
 	 * endpoint.
 	 * @param jsonMapper The JSON object mapper to use for message
@@ -153,23 +174,29 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 	 * @param keepAliveInterval The interval for keep-alive pings, or null to disable
 	 * keep-alive functionality
 	 * @param contextExtractor The extractor for transport context from the request.
-	 * @deprecated Use the builder {@link #builder()} instead for better configuration
-	 * options.
+	 * @param httpHeaderValidator The HTTP header validator for validating HTTP requests.
+	 * @param requestMaxSize The maximum size, in bytes, of a single request body. Must be
+	 * positive.
 	 */
 	private HttpServletSseServerTransportProvider(McpJsonMapper jsonMapper, String baseUrl, String messageEndpoint,
 			String sseEndpoint, Duration keepAliveInterval,
-			McpTransportContextExtractor<HttpServletRequest> contextExtractor) {
+			McpTransportContextExtractor<HttpServletRequest> contextExtractor,
+			ServerHttpHeaderValidator httpHeaderValidator, int requestMaxSize) {
 
 		Assert.notNull(jsonMapper, "JsonMapper must not be null");
 		Assert.notNull(messageEndpoint, "messageEndpoint must not be null");
 		Assert.notNull(sseEndpoint, "sseEndpoint must not be null");
 		Assert.notNull(contextExtractor, "Context extractor must not be null");
+		Assert.notNull(httpHeaderValidator, "HTTP header validator must not be null");
+		Assert.isTrue(requestMaxSize > 0, "requestMaxSize must be positive");
 
 		this.jsonMapper = jsonMapper;
 		this.baseUrl = baseUrl;
 		this.messageEndpoint = messageEndpoint;
 		this.sseEndpoint = sseEndpoint;
 		this.contextExtractor = contextExtractor;
+		this.httpHeaderValidator = httpHeaderValidator;
+		this.requestMaxSize = requestMaxSize;
 
 		if (keepAliveInterval != null) {
 
@@ -220,6 +247,25 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 			.then();
 	}
 
+	@Override
+	public Mono<Void> notifyClient(String sessionId, String method, Object params) {
+		return Mono.defer(() -> {
+			// Need to iterate in O(n) because the transport session id
+			// is different from the server-logical session id (in streamable http this
+			// design issue was solved)
+			McpServerSession session = sessions.values()
+				.stream()
+				.filter(s -> sessionId.equals(s.getId()))
+				.findFirst()
+				.orElse(null);
+			if (session == null) {
+				logger.debug("Session {} not found", sessionId);
+				return Mono.empty();
+			}
+			return session.sendNotification(method, params);
+		});
+	}
+
 	/**
 	 * Handles GET requests to establish SSE connections.
 	 * <p>
@@ -246,11 +292,18 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 			return;
 		}
 
+		try {
+			this.httpHeaderValidator.validate(new HttpServletHeaderAccessor(request));
+		}
+		catch (ServerTransportSecurityException e) {
+			response.sendError(e.getStatusCode(), e.getMessage());
+			return;
+		}
+
 		response.setContentType("text/event-stream");
 		response.setCharacterEncoding(UTF_8);
 		response.setHeader("Cache-Control", "no-cache");
 		response.setHeader("Connection", "keep-alive");
-		response.setHeader("Access-Control-Allow-Origin", "*");
 
 		String sessionId = UUID.randomUUID().toString();
 		AsyncContext asyncContext = request.startAsync();
@@ -305,9 +358,22 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 			return;
 		}
 
+		if (request.getContentLengthLong() > this.requestMaxSize) {
+			response.sendError(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
+			return;
+		}
+
 		String requestURI = request.getRequestURI();
 		if (!requestURI.endsWith(messageEndpoint)) {
 			response.sendError(HttpServletResponse.SC_NOT_FOUND);
+			return;
+		}
+
+		try {
+			this.httpHeaderValidator.validate(new HttpServletHeaderAccessor(request));
+		}
+		catch (ServerTransportSecurityException e) {
+			response.sendError(e.getStatusCode(), e.getMessage());
 			return;
 		}
 
@@ -317,7 +383,9 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 			response.setContentType(APPLICATION_JSON);
 			response.setCharacterEncoding(UTF_8);
 			response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
-			String jsonError = jsonMapper.writeValueAsString(new McpError("Session ID missing in message endpoint"));
+			String jsonError = jsonMapper.writeValueAsString(McpError.builder(McpSchema.ErrorCodes.METHOD_NOT_FOUND)
+				.message("Session ID missing in message endpoint")
+				.build());
 			PrintWriter writer = response.getWriter();
 			writer.write(jsonError);
 			writer.flush();
@@ -330,7 +398,9 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 			response.setContentType(APPLICATION_JSON);
 			response.setCharacterEncoding(UTF_8);
 			response.setStatus(HttpServletResponse.SC_NOT_FOUND);
-			String jsonError = jsonMapper.writeValueAsString(new McpError("Session not found: " + sessionId));
+			String jsonError = jsonMapper.writeValueAsString(McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR)
+				.message("Session not found: " + sessionId)
+				.build());
 			PrintWriter writer = response.getWriter();
 			writer.write(jsonError);
 			writer.flush();
@@ -338,15 +408,10 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 		}
 
 		try {
-			BufferedReader reader = request.getReader();
-			StringBuilder body = new StringBuilder();
-			String line;
-			while ((line = reader.readLine()) != null) {
-				body.append(line);
-			}
+			String body = HttpServletRequestUtils.readBody(request, this.requestMaxSize);
 
 			final McpTransportContext transportContext = this.contextExtractor.extract(request);
-			McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(jsonMapper, body.toString());
+			McpSchema.JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(jsonMapper, body);
 
 			// Process the message through the session's handle method
 			// Block for Servlet compatibility
@@ -354,10 +419,15 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 
 			response.setStatus(HttpServletResponse.SC_OK);
 		}
+		catch (MaxSizeExceededException e) {
+			response.sendError(HttpServletResponse.SC_REQUEST_ENTITY_TOO_LARGE);
+		}
 		catch (Exception e) {
 			logger.error("Error processing message: {}", e.getMessage());
 			try {
-				McpError mcpError = new McpError(e.getMessage());
+				McpError mcpError = McpError.builder(McpSchema.ErrorCodes.INTERNAL_ERROR)
+					.message(e.getMessage())
+					.build();
 				response.setContentType(APPLICATION_JSON);
 				response.setCharacterEncoding(UTF_8);
 				response.setStatus(HttpServletResponse.SC_INTERNAL_SERVER_ERROR);
@@ -547,6 +617,10 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 
 		private Duration keepAliveInterval;
 
+		private ServerHttpHeaderValidator httpHeaderValidator = ServerHttpHeaderValidator.NOOP;
+
+		private int requestMaxSize = DEFAULT_REQUEST_MAX_SIZE;
+
 		/**
 		 * Sets the JsonMapper implementation to use for serialization/deserialization. If
 		 * not specified, a JacksonJsonMapper will be created from the configured
@@ -622,6 +696,46 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 		}
 
 		/**
+		 * Sets the security validator for validating HTTP requests.
+		 * @param securityValidator The security validator to use. Must not be null.
+		 * @return This builder instance
+		 * @throws IllegalArgumentException if securityValidator is null
+		 * @deprecated Use {@link #httpHeaderValidator(ServerHttpHeaderValidator)}
+		 * instead.
+		 */
+		@Deprecated
+		public Builder securityValidator(ServerTransportSecurityValidator securityValidator) {
+			Assert.notNull(securityValidator, "Security validator must not be null");
+			this.httpHeaderValidator = ServerTransportSecurityValidator.toHttpHeaderValidator(securityValidator);
+			return this;
+		}
+
+		/**
+		 * Sets the HTTP header validator for validating HTTP requests.
+		 * @param httpHeaderValidator The HTTP header validator to use. Must not be null.
+		 * @return This builder instance
+		 * @throws IllegalArgumentException if httpHeaderValidator is null
+		 */
+		public Builder httpHeaderValidator(ServerHttpHeaderValidator httpHeaderValidator) {
+			Assert.notNull(httpHeaderValidator, "HTTP header validator must not be null");
+			this.httpHeaderValidator = httpHeaderValidator;
+			return this;
+		}
+
+		/**
+		 * Sets the maximum size, in bytes, of a single request body accepted by this
+		 * transport. Requests whose body exceeds this size are rejected with a 413
+		 * (Payload Too Large) response. Defaults to 16 MiB if not set.
+		 * @param requestMaxSize The maximum request body size, in bytes. Must be
+		 * positive.
+		 * @return This builder instance
+		 */
+		public Builder maxRequestSize(int requestMaxSize) {
+			this.requestMaxSize = requestMaxSize;
+			return this;
+		}
+
+		/**
 		 * Builds a new instance of HttpServletSseServerTransportProvider with the
 		 * configured settings.
 		 * @return A new HttpServletSseServerTransportProvider instance
@@ -632,8 +746,8 @@ public class HttpServletSseServerTransportProvider extends HttpServlet implement
 				throw new IllegalStateException("MessageEndpoint must be set");
 			}
 			return new HttpServletSseServerTransportProvider(
-					jsonMapper == null ? McpJsonMapper.getDefault() : jsonMapper, baseUrl, messageEndpoint, sseEndpoint,
-					keepAliveInterval, contextExtractor);
+					jsonMapper == null ? McpJsonDefaults.getMapper() : jsonMapper, baseUrl, messageEndpoint,
+					sseEndpoint, keepAliveInterval, contextExtractor, httpHeaderValidator, requestMaxSize);
 		}
 
 	}

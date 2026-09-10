@@ -38,6 +38,7 @@ public class McpServerFeatures {
 	 * @param rootsChangeConsumers The list of consumers that will be notified when the
 	 * roots list changes
 	 * @param instructions The server instructions text
+	 * @param toolFilters The per-request filters deciding which tools are listed
 	 */
 	record Async(McpSchema.Implementation serverInfo, McpSchema.ServerCapabilities serverCapabilities,
 			List<McpServerFeatures.AsyncToolSpecification> tools, Map<String, AsyncResourceSpecification> resources,
@@ -45,7 +46,7 @@ public class McpServerFeatures {
 			Map<String, McpServerFeatures.AsyncPromptSpecification> prompts,
 			Map<McpSchema.CompleteReference, McpServerFeatures.AsyncCompletionSpecification> completions,
 			List<BiFunction<McpAsyncServerExchange, List<McpSchema.Root>, Mono<Void>>> rootsChangeConsumers,
-			String instructions) {
+			String instructions, List<McpAsyncListFilter<McpSchema.Tool>> toolFilters) {
 
 		/**
 		 * Create an instance and validate the arguments.
@@ -58,6 +59,7 @@ public class McpServerFeatures {
 		 * @param rootsChangeConsumers The list of consumers that will be notified when
 		 * the roots list changes
 		 * @param instructions The server instructions text
+		 * @param toolFilters The per-request filters deciding which tools are listed
 		 */
 		Async(McpSchema.Implementation serverInfo, McpSchema.ServerCapabilities serverCapabilities,
 				List<McpServerFeatures.AsyncToolSpecification> tools, Map<String, AsyncResourceSpecification> resources,
@@ -65,7 +67,7 @@ public class McpServerFeatures {
 				Map<String, McpServerFeatures.AsyncPromptSpecification> prompts,
 				Map<McpSchema.CompleteReference, McpServerFeatures.AsyncCompletionSpecification> completions,
 				List<BiFunction<McpAsyncServerExchange, List<McpSchema.Root>, Mono<Void>>> rootsChangeConsumers,
-				String instructions) {
+				String instructions, List<McpAsyncListFilter<McpSchema.Tool>> toolFilters) {
 
 			Assert.notNull(serverInfo, "Server info must not be null");
 
@@ -77,10 +79,12 @@ public class McpServerFeatures {
 																					// logging
 																					// by
 																					// default
-							!Utils.isEmpty(prompts) ? new McpSchema.ServerCapabilities.PromptCapabilities(false) : null,
+							!Utils.isEmpty(prompts) ? McpSchema.ServerCapabilities.PromptCapabilities.builder().build()
+									: null,
 							!Utils.isEmpty(resources)
-									? new McpSchema.ServerCapabilities.ResourceCapabilities(false, false) : null,
-							!Utils.isEmpty(tools) ? new McpSchema.ServerCapabilities.ToolCapabilities(false) : null);
+									? McpSchema.ServerCapabilities.ResourceCapabilities.builder().build() : null,
+							!Utils.isEmpty(tools) ? McpSchema.ServerCapabilities.ToolCapabilities.builder().build()
+									: null);
 
 			this.tools = (tools != null) ? tools : List.of();
 			this.resources = (resources != null) ? resources : Map.of();
@@ -89,6 +93,7 @@ public class McpServerFeatures {
 			this.completions = (completions != null) ? completions : Map.of();
 			this.rootsChangeConsumers = (rootsChangeConsumers != null) ? rootsChangeConsumers : List.of();
 			this.instructions = instructions;
+			this.toolFilters = (toolFilters != null) ? toolFilters : List.of();
 		}
 
 		/**
@@ -136,7 +141,11 @@ public class McpServerFeatures {
 			}
 
 			return new Async(syncSpec.serverInfo(), syncSpec.serverCapabilities(), tools, resources, resourceTemplates,
-					prompts, completions, rootChangeConsumers, syncSpec.instructions());
+					prompts, completions, rootChangeConsumers, syncSpec.instructions(),
+					syncSpec.toolFilters()
+						.stream()
+						.map(filter -> McpAsyncListFilter.fromSync(filter, immediateExecution))
+						.toList());
 		}
 	}
 
@@ -159,7 +168,8 @@ public class McpServerFeatures {
 			Map<String, McpServerFeatures.SyncResourceTemplateSpecification> resourceTemplates,
 			Map<String, McpServerFeatures.SyncPromptSpecification> prompts,
 			Map<McpSchema.CompleteReference, McpServerFeatures.SyncCompletionSpecification> completions,
-			List<BiConsumer<McpSyncServerExchange, List<McpSchema.Root>>> rootsChangeConsumers, String instructions) {
+			List<BiConsumer<McpSyncServerExchange, List<McpSchema.Root>>> rootsChangeConsumers, String instructions,
+			List<McpSyncListFilter<McpSchema.Tool>> toolFilters) {
 
 		/**
 		 * Create an instance and validate the arguments.
@@ -172,6 +182,7 @@ public class McpServerFeatures {
 		 * @param rootsChangeConsumers The list of consumers that will be notified when
 		 * the roots list changes
 		 * @param instructions The server instructions text
+		 * @param toolFilters The per-request filters deciding which tools are listed
 		 */
 		Sync(McpSchema.Implementation serverInfo, McpSchema.ServerCapabilities serverCapabilities,
 				List<McpServerFeatures.SyncToolSpecification> tools,
@@ -179,8 +190,8 @@ public class McpServerFeatures {
 				Map<String, McpServerFeatures.SyncResourceTemplateSpecification> resourceTemplates,
 				Map<String, McpServerFeatures.SyncPromptSpecification> prompts,
 				Map<McpSchema.CompleteReference, McpServerFeatures.SyncCompletionSpecification> completions,
-				List<BiConsumer<McpSyncServerExchange, List<McpSchema.Root>>> rootsChangeConsumers,
-				String instructions) {
+				List<BiConsumer<McpSyncServerExchange, List<McpSchema.Root>>> rootsChangeConsumers, String instructions,
+				List<McpSyncListFilter<McpSchema.Tool>> toolFilters) {
 
 			Assert.notNull(serverInfo, "Server info must not be null");
 
@@ -192,10 +203,12 @@ public class McpServerFeatures {
 																					// logging
 																					// by
 																					// default
-							!Utils.isEmpty(prompts) ? new McpSchema.ServerCapabilities.PromptCapabilities(false) : null,
+							!Utils.isEmpty(prompts) ? McpSchema.ServerCapabilities.PromptCapabilities.builder().build()
+									: null,
 							!Utils.isEmpty(resources)
-									? new McpSchema.ServerCapabilities.ResourceCapabilities(false, false) : null,
-							!Utils.isEmpty(tools) ? new McpSchema.ServerCapabilities.ToolCapabilities(false) : null);
+									? McpSchema.ServerCapabilities.ResourceCapabilities.builder().build() : null,
+							!Utils.isEmpty(tools) ? McpSchema.ServerCapabilities.ToolCapabilities.builder().build()
+									: null);
 
 			this.tools = (tools != null) ? tools : new ArrayList<>();
 			this.resources = (resources != null) ? resources : new HashMap<>();
@@ -204,6 +217,7 @@ public class McpServerFeatures {
 			this.completions = (completions != null) ? completions : new HashMap<>();
 			this.rootsChangeConsumers = (rootsChangeConsumers != null) ? rootsChangeConsumers : new ArrayList<>();
 			this.instructions = instructions;
+			this.toolFilters = (toolFilters != null) ? toolFilters : List.of();
 		}
 
 	}
@@ -223,18 +237,7 @@ public class McpServerFeatures {
 	 * map of tool arguments.
 	 */
 	public record AsyncToolSpecification(McpSchema.Tool tool,
-			@Deprecated BiFunction<McpAsyncServerExchange, Map<String, Object>, Mono<McpSchema.CallToolResult>> call,
 			BiFunction<McpAsyncServerExchange, McpSchema.CallToolRequest, Mono<McpSchema.CallToolResult>> callHandler) {
-
-		/**
-		 * @deprecated Use {@link AsyncToolSpecification(McpSchema.Tool, null,
-		 * BiFunction)} instead.
-		 **/
-		@Deprecated
-		public AsyncToolSpecification(McpSchema.Tool tool,
-				BiFunction<McpAsyncServerExchange, Map<String, Object>, Mono<McpSchema.CallToolResult>> call) {
-			this(tool, call, (exchange, toolReq) -> call.apply(exchange, toolReq.arguments()));
-		}
 
 		static AsyncToolSpecification fromSync(SyncToolSpecification syncToolSpec) {
 			return fromSync(syncToolSpec, false);
@@ -247,13 +250,6 @@ public class McpServerFeatures {
 				return null;
 			}
 
-			BiFunction<McpAsyncServerExchange, Map<String, Object>, Mono<McpSchema.CallToolResult>> deprecatedCall = (syncToolSpec
-				.call() != null) ? (exchange, map) -> {
-					var toolResult = Mono
-						.fromCallable(() -> syncToolSpec.call().apply(new McpSyncServerExchange(exchange), map));
-					return immediate ? toolResult : toolResult.subscribeOn(Schedulers.boundedElastic());
-				} : null;
-
 			BiFunction<McpAsyncServerExchange, McpSchema.CallToolRequest, Mono<McpSchema.CallToolResult>> callHandler = (
 					exchange, req) -> {
 				var toolResult = Mono
@@ -261,7 +257,7 @@ public class McpServerFeatures {
 				return immediate ? toolResult : toolResult.subscribeOn(Schedulers.boundedElastic());
 			};
 
-			return new AsyncToolSpecification(syncToolSpec.tool(), deprecatedCall, callHandler);
+			return new AsyncToolSpecification(syncToolSpec.tool(), callHandler);
 		}
 
 		/**
@@ -304,7 +300,7 @@ public class McpServerFeatures {
 				Assert.notNull(tool, "Tool must not be null");
 				Assert.notNull(callHandler, "Call handler function must not be null");
 
-				return new AsyncToolSpecification(tool, null, callHandler);
+				return new AsyncToolSpecification(tool, callHandler);
 			}
 
 		}
@@ -505,43 +501,32 @@ public class McpServerFeatures {
 	 *
 	 * <pre>{@code
 	 * McpServerFeatures.SyncToolSpecification.builder()
-	 * 		.tool(Tool.builder()
-	 * 				.name("calculator")
+	 * 		.tool(Tool.builder("calculator",
+	 * 					Map.of("type", "object", "properties",
+	 * 							Map.of("expression", Map.of("type", "string")),
+	 * 							"required", List.of("expression")))
 	 * 				.title("Performs mathematical calculations")
-	 * 				.inputSchema(new JsonSchemaObject()
-	 * 						.required("expression")
-	 * 						.property("expression", JsonSchemaType.STRING))
-	 * 				.build()
+	 * 				.build())
 	 * 		.toolHandler((exchange, req) -> {
 	 * 			String expr = (String) req.arguments().get("expression");
 	 * 			return CallToolResult.builder()
-	 *                   .content(List.of(new McpSchema.TextContent("Result: " + evaluate(expr))))
+	 *                   .content(List.of(McpSchema.TextContent.builder("Result: " + evaluate(expr)).build()))
 	 *                   .isError(false)
 	 *                   .build();
-	 * 		}))
+	 * 		})
 	 *      .build();
 	 * }</pre>
 	 *
 	 * @param tool The tool definition including name, description, and parameter schema
-	 * @param call (Deprected) The function that implements the tool's logic, receiving
-	 * arguments and returning results. The function's first argument is an
-	 * {@link McpSyncServerExchange} upon which the server can interact with the connected
 	 * @param callHandler The function that implements the tool's logic, receiving a
 	 * {@link McpSyncServerExchange} and a
 	 * {@link io.modelcontextprotocol.spec.McpSchema.CallToolRequest} and returning
 	 * results. The function's first argument is an {@link McpSyncServerExchange} upon
-	 * which the server can interact with the client. The second arguments is a map of
-	 * arguments passed to the tool.
+	 * which the server can interact with the client. The second argument is a request
+	 * object containing the arguments passed to the tool.
 	 */
 	public record SyncToolSpecification(McpSchema.Tool tool,
-			@Deprecated BiFunction<McpSyncServerExchange, Map<String, Object>, McpSchema.CallToolResult> call,
 			BiFunction<McpSyncServerExchange, CallToolRequest, McpSchema.CallToolResult> callHandler) {
-
-		@Deprecated
-		public SyncToolSpecification(McpSchema.Tool tool,
-				BiFunction<McpSyncServerExchange, Map<String, Object>, McpSchema.CallToolResult> call) {
-			this(tool, call, (exchange, toolReq) -> call.apply(exchange, toolReq.arguments()));
-		}
 
 		/**
 		 * Builder for creating SyncToolSpecification instances.
@@ -583,7 +568,7 @@ public class McpServerFeatures {
 				Assert.notNull(tool, "Tool must not be null");
 				Assert.notNull(callHandler, "CallTool function must not be null");
 
-				return new SyncToolSpecification(tool, null, callHandler);
+				return new SyncToolSpecification(tool, callHandler);
 			}
 
 		}
